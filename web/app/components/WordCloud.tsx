@@ -5,6 +5,8 @@ import { useMemo } from "react";
 type Entry = {
   term: string;
   weight: number;
+  recency?: number;
+  conflict?: boolean;
 };
 
 type Props = {
@@ -45,17 +47,21 @@ export function WordCloud({ entries }: Props) {
       </defs>
       <rect x="0" y="0" width="480" height="320" fill="#fffdfa" rx="14" />
       {layout.map((item, idx) => (
-        <text
-          key={`${item.term}-${idx}`}
-          x={item.x}
-          y={item.y}
-          fill="url(#g)"
-          fontSize={item.size}
-          textAnchor="middle"
-          style={{ fontFamily: "Rockwell, Georgia, serif", opacity: 0.9 }}
-        >
-          {item.term}
-        </text>
+        <g key={`${item.term}-${idx}`}>
+          <text
+            x={item.x}
+            y={item.y}
+            fill={item.conflict ? "#b91c1c" : "url(#g)"}
+            fontSize={item.size}
+            textAnchor="middle"
+            style={{ fontFamily: "Rockwell, Georgia, serif", opacity: item.recency ?? 0.9 }}
+          >
+            {item.term}
+          </text>
+          {item.conflict ? (
+            <circle cx={item.x + item.size * 0.4} cy={item.y - item.size * 0.6} r={4} fill="#b91c1c" />
+          ) : null}
+        </g>
       ))}
     </svg>
   );

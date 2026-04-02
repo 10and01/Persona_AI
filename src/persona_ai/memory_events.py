@@ -33,6 +33,17 @@ class MemoryEventBus:
     def publish(self, event: MemoryMutationEvent) -> None:
         if not event.trace_id or not event.session_id or event.turn_id < 0:
             raise ValueError("invalid mutation event identifiers")
+        if event.operation == "distillation_requested":
+            trigger = event.after.get("trigger")
+            if not isinstance(trigger, str) or not trigger:
+                raise ValueError("distillation_requested requires non-empty trigger")
+        if event.operation == "distillation_completed":
+            updated_fields = event.after.get("updated_fields")
+            evidence_count = event.after.get("evidence_count")
+            if not isinstance(updated_fields, list):
+                raise ValueError("distillation_completed requires updated_fields list")
+            if not isinstance(evidence_count, int) or evidence_count < 0:
+                raise ValueError("distillation_completed requires non-negative evidence_count")
         self._events.append(event)
 
     def for_turn(self, session_id: str, turn_id: int) -> List[MemoryMutationEvent]:

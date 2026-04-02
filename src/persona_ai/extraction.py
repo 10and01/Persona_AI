@@ -21,6 +21,40 @@ class EvidenceIngestionPipeline:
     POSITIVE_HINTS = {"great", "thanks", "love", "perfect", "好", "喜欢", "满意"}
     NEGATIVE_HINTS = {"bad", "hate", "wrong", "broken", "讨厌", "糟糕", "不行"}
 
+    def clean_text(self, text: str) -> str:
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        return cleaned
+
+    def extract_core_semantics(self, text: str, max_terms: int = 8) -> List[str]:
+        cleaned = self.clean_text(text).lower()
+        candidates = re.findall(r"[a-zA-Z\u4e00-\u9fff][a-zA-Z0-9_\u4e00-\u9fff]{1,}", cleaned)
+        stop_words = {
+            "the",
+            "and",
+            "with",
+            "that",
+            "this",
+            "for",
+            "are",
+            "you",
+            "请",
+            "然后",
+            "我们",
+            "可以",
+            "一个",
+            "一下",
+        }
+        uniq: List[str] = []
+        seen = set()
+        for token in candidates:
+            if token in stop_words or token in seen:
+                continue
+            seen.add(token)
+            uniq.append(token)
+            if len(uniq) >= max_terms:
+                break
+        return uniq
+
     def ingest(self, item: ExtractionInput) -> List[Evidence]:
         text = item.text.lower()
         timestamp = datetime.now(timezone.utc)

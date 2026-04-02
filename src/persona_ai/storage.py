@@ -3,22 +3,117 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+import hashlib
+from typing import Dict, List, Optional, Protocol, Tuple
 
 from .memory_events import MemoryEventBus, make_event
-from .models import L1DialogRecord, L2SessionContext, L3ProfileVersion, RetentionPolicy
+from .models import L1DialogRecord, L2SessionContext, L3ProfileVersion, MemoryMetadata, RetentionPolicy
+
+
+class EpisodicVectorStore(Protocol):
+    def upsert_dialog(self, record: L1DialogRecord, metadata: MemoryMetadata, idempotency_key: str) -> None:
+        raise NotImplementedError
+
+    def search_dialogs(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        limit: int,
+        sentiment: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[str]:
+        raise NotImplementedError
+
+    def delete_user_scope(self, user_id: str, scope: str) -> int:
+        raise NotImplementedError
+
+
+class SemanticGraphStore(Protocol):
+    def upsert_profile_version(self, version: L3ProfileVersion, metadata: MemoryMetadata) -> None:
+        raise NotImplementedError
+
+    def latest_profile_version(self, user_id: str) -> Optional[int]:
+        raise NotImplementedError
+
+    def delete_user_scope(self, user_id: str, scope: str) -> int:
+        raise NotImplementedError
+
+
+class NoopEpisodicVectorStore:
+    def upsert_dialog(self, record: L1DialogRecord, metadata: MemoryMetadata, idempotency_key: str) -> None:
+        _ = (record, metadata, idempotency_key)
+
+    def search_dialogs(
+        self,
+        *,
+        user_id: str,
+        query: str,
+        limit: int,
+        sentiment: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+    ) -> List[str]:
+        _ = (user_id, query, limit, sentiment, start_time, end_time)
+        return []
+
+    def delete_user_scope(self, user_id: str, scope: str) -> int:
+        _ = (user_id, scope)
+        return 0
+
+
+class NoopSemanticGraphStore:
+    def upsert_profile_version(self, version: L3ProfileVersion, metadata: MemoryMetadata) -> None:
+        _ = (version, metadata)
+
+    def latest_profile_version(self, user_id: str) -> Optional[int]:
+        _ = user_id
+        return None
+
+    def delete_user_scope(self, user_id: str, scope: str) -> int:
+        _ = (user_id, scope)
+        return 0
 
 
 class MemoryStore:
-    def __init__(self, retention: Optional[RetentionPolicy] = None, event_bus: Optional[MemoryEventBus] = None) -> None:
+    def __init__(
+        self,
+        retention: Optional[RetentionPolicy] = None,
+        event_bus: Optional[MemoryEventBus] = None,
+        episodic_store: Optional[EpisodicVectorStore] = None,
+        semantic_store: Optional[SemanticGraphStore] = None,
+    ) -> None:
         self.retention = retention or RetentionPolicy()
         self.event_bus = event_bus
+        self.episodic_store = episodic_store or NoopEpisodicVectorStore()
+        self.semantic_store = semantic_store or NoopSemanticGraphStore()
         self._l1: List[L1DialogRecord] = []
         self._l2: Dict[str, L2SessionContext] = {}
         self._l3: Dict[str, List[L3ProfileVersion]] = defaultdict(list)
 
+    @staticmethod
+    def normalize_metadata(data: Dict[str, object]) -> MemoryMetadata:
+        return MemoryMetadata.from_dict({
+            "timestamp": data.get("timestamp"),
+            "trace_id": data.get("trace_id", ""),
+            "confidence": data.get("confidence", 0.0),
+            "source_turn_id": data.get("source_turn_id", -1),
+        })
+
     def append_l1(self, record: L1DialogRecord) -> None:
         self._l1.append(record)
+        metadata = self.normalize_metadata(
+            {
+                "timestamp": record.occurred_at,
+                "trace_id": record.metadata.get("trace_id", ""),
+                "confidence": record.metadata.get("confidence", 0.0),
+                "source_turn_id": record.turn_id,
+            }
+        )
+        content_hash = hashlib.sha256(f"{record.user_input}|{record.assistant_output}".encode("utf-8")).hexdigest()[:16]
+        idempotency_key = f"{record.user_id}:{record.session_id}:{record.turn_id}:{content_hash}"
+        self.episodic_store.upsert_dialog(record, metadata, idempotency_key)
         if self.event_bus:
             trace_id = str(record.metadata.get("trace_id", ""))
             if trace_id:
@@ -88,6 +183,15 @@ class MemoryStore:
         previous = versions[-1] if versions else None
         versions.append(version)
         versions.sort(key=lambda v: v.version)
+        metadata = self.normalize_metadata(
+            {
+                "timestamp": version.created_at,
+                "trace_id": version.metadata.get("trace_id", ""),
+                "confidence": max((f.confidence for f in version.fields.values()), default=0.0),
+                "source_turn_id": version.metadata.get("turn_id", -1),
+            }
+        )
+        self.semantic_store.upsert_profile_version(version, metadata)
         if self.event_bus:
             trace_id = str(version.metadata.get("trace_id", ""))
             session_id = str(version.metadata.get("session_id", ""))
@@ -130,7 +234,7 @@ class MemoryStore:
                 self._l3[user_id] = versions[-self.retention.l3_history_limit :]
 
     def delete_user_scope(self, user_id: str, scope: str) -> Dict[str, int]:
-        deleted = {"l1": 0, "l2": 0, "l3": 0}
+        deleted = {"l1": 0, "l2": 0, "l3": 0, "episodic": 0, "semantic": 0}
         if scope in {"complete", "l1"}:
             before = len(self._l1)
             self._l1 = [r for r in self._l1 if r.user_id != user_id]
@@ -145,5 +249,8 @@ class MemoryStore:
         if scope in {"complete", "profile_only", "l3"}:
             deleted["l3"] = len(self._l3.get(user_id, []))
             self._l3[user_id] = []
+
+        deleted["episodic"] = self.episodic_store.delete_user_scope(user_id=user_id, scope=scope)
+        deleted["semantic"] = self.semantic_store.delete_user_scope(user_id=user_id, scope=scope)
 
         return deleted

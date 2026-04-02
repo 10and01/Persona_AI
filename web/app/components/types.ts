@@ -30,9 +30,24 @@ export type EpisodicHit = {
 export type RetrievalContext = {
   semanticVersion: number;
   semanticFields: string[];
+  evidenceRefs: Array<{
+    sourceLayer: string;
+    sourceId: string;
+    sourceTurnId: number;
+    score: number;
+  }>;
+  retrievalSources: string[];
+  distillationBatchStatus: "idle" | "requested" | "completed";
   episodicHits: EpisodicHit[];
   workingSummary: string;
   injectedPrompt: string;
+};
+
+export type GovernanceMeta = {
+  consent: boolean;
+  policyVersion: string;
+  fieldCount: number;
+  traceId: string;
 };
 
 export type PersonaField = {

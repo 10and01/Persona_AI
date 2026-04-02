@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable
 
@@ -36,6 +37,56 @@ class PrivacyController:
 
     def redact(self, data: Dict[str, Any], approved_fields: set[str]) -> Dict[str, Any]:
         return {k: v for k, v in data.items() if k in approved_fields}
+
+    def sanitize_text(self, text: str) -> str:
+        masked = text
+        # Mask long digit sequences and common ID-like patterns.
+        masked = re.sub(r"\b\d{8,}\b", "[REDACTED_NUMBER]", masked)
+        masked = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED_EMAIL]", masked)
+        return masked
+
+    def sanitize_record_payload(self, payload: Dict[str, Any], actor: str = "system") -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, str):
+                out[key] = self.sanitize_text(value)
+            elif isinstance(value, list):
+                out[key] = [self.sanitize_text(item) if isinstance(item, str) else item for item in value]
+            elif isinstance(value, dict):
+                out[key] = {
+                    subkey: self.sanitize_text(subval) if isinstance(subval, str) else subval
+                    for subkey, subval in value.items()
+                }
+            else:
+                out[key] = value
+        self.audit.append(
+            event_type="sanitize",
+            actor=actor,
+            result="ok",
+            details={"keys": sorted(out.keys())},
+        )
+        return out
+
+    def governed_injection_fields(
+        self,
+        *,
+        purpose: str,
+        candidate_fields: Dict[str, Any],
+        actor: str,
+    ) -> Dict[str, Any]:
+        decision = self.authorize(purpose=purpose, requested_fields=candidate_fields.keys(), actor=actor)
+        safe = self.redact(candidate_fields, decision.approved_fields)
+        self.audit.append(
+            event_type="retrieval_injection",
+            actor=actor,
+            result="ok" if safe else "partial",
+            details={
+                "purpose": purpose,
+                "approved": sorted(decision.approved_fields),
+                "denied": sorted(decision.denied_fields),
+            },
+        )
+        return safe
 
     def delete_scope(self, user_id: str, scope: str, actor: str) -> Dict[str, Any]:
         deleted = self.store.delete_user_scope(user_id=user_id, scope=scope)

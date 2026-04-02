@@ -6,7 +6,8 @@ from typing import Dict, Iterable
 
 from .audit import ImmutableAuditLog
 from .confidence import compute_confidence, is_actionable
-from .models import Evidence, L3ProfileField, L3ProfileVersion
+from .conflict_resolution import ConflictResolver
+from .models import DistillStatus, Evidence, EvidenceRef, L3ProfileField, L3ProfileVersion
 from .storage import MemoryStore
 
 
@@ -14,6 +15,7 @@ class ProfileManager:
     def __init__(self, store: MemoryStore, audit_log: ImmutableAuditLog) -> None:
         self.store = store
         self.audit_log = audit_log
+        self.conflict_resolver = ConflictResolver()
 
     def aggregate_fields(
         self,
@@ -30,17 +32,22 @@ class ProfileManager:
 
         current = fields.get(field_name, L3ProfileField(name=field_name, value=None, confidence=0.0))
         new_evidence = list(current.evidence) + list(evidence)
+        new_refs = list(current.evidence_ref)
+        if session_id and turn_id >= 0:
+            new_refs.append(EvidenceRef(source_layer="L1", source_id=f"{session_id}:{turn_id}", source_turn_id=turn_id))
+        resolution = self.conflict_resolver.resolve(current_value=current.value, evidence=new_evidence)
         contradictions = list(current.contradictions)
-        if contradiction:
+        if contradiction or resolution.contradiction_detected:
             contradictions.extend(list(evidence))
 
         confidence = compute_confidence(new_evidence, contradiction_count=len(contradictions))
-        selected_value = new_evidence[-1].value if new_evidence else current.value
+        selected_value = resolution.selected_value if new_evidence else current.value
         updated = replace(
             current,
             value=selected_value,
             confidence=confidence,
             evidence=new_evidence,
+            evidence_ref=new_refs,
             contradictions=contradictions,
             updated_at=datetime.now(timezone.utc),
         )
@@ -54,6 +61,7 @@ class ProfileManager:
             fields=fields,
             previous_version=latest.version if latest else None,
             metadata={"session_id": session_id, "turn_id": turn_id, "trace_id": trace_id},
+            distill_status=DistillStatus.COMPLETED if new_evidence else DistillStatus.SKIPPED,
         )
         self.store.append_l3_version(version)
         self.audit_log.append(
@@ -65,6 +73,8 @@ class ProfileManager:
                 "field_name": field_name,
                 "version": version_num,
                 "actionable": is_actionable(confidence),
+                "conflict_rationale": resolution.rationale,
+                "preference_shift": resolution.preference_shift,
             },
         )
         return version

@@ -13,6 +13,23 @@ type EpisodicHit = {
   snippet: string;
 };
 
+type PersonaMap = Record<
+  string,
+  {
+    value: string;
+    confidence: number;
+    evidenceClass: string;
+    updatedAt: string;
+  }
+>;
+
+type GovernanceMeta = {
+  consent: boolean;
+  policyVersion: string;
+  fieldCount: number;
+  traceId: string;
+};
+
 async function parseJsonOrThrow(resp: Response, provider: string, endpoint: string) {
   const contentType = (resp.headers.get("content-type") || "").toLowerCase();
   const text = await resp.text();
@@ -127,7 +144,7 @@ function extractTurnSignals(userText: string) {
 }
 
 function buildMemoryInjectionPrompt(
-  profile: ReturnType<typeof inferPersona>,
+  profile: PersonaMap,
   workingSummary: string,
   episodicHits: EpisodicHit[],
 ) {
@@ -144,6 +161,17 @@ function buildMemoryInjectionPrompt(
 
   if (lines.length === 0) return "";
   return `Use the memory context below when it is relevant and safe.\n${lines.join("\n")}`;
+}
+
+function sanitizeText(text: string) {
+  return text
+    .replace(/\b\d{8,}\b/g, "[REDACTED_NUMBER]")
+    .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[REDACTED_EMAIL]");
+}
+
+function governedInjectionProfile(profile: PersonaMap) {
+  const allowedFields = new Set(["response_style", "language", "tone", "focus_area"]);
+  return Object.fromEntries(Object.entries(profile).filter(([name]) => allowedFields.has(name)));
 }
 
 async function callOpenAI(messages: IncomingMessage[]) {
@@ -239,10 +267,11 @@ export async function POST(request: NextRequest) {
     const userText = String(body.userText || "");
     const traceId = crypto.randomUUID();
     const profile = inferPersona(userText);
+    const governedProfile = governedInjectionProfile(profile);
     const turnSignals = extractTurnSignals(userText);
     const workingSummary = summarizeWorkingMemory(messages, 6);
     const episodicHits = retrieveEpisodicHits(messages, userText, 3);
-    const memoryPrompt = buildMemoryInjectionPrompt(profile, workingSummary, episodicHits);
+    const memoryPrompt = sanitizeText(buildMemoryInjectionPrompt(governedProfile, workingSummary, episodicHits));
 
     const requestMessages = memoryPrompt
       ? ([{ role: "system", content: memoryPrompt } as IncomingMessage, ...messages])
@@ -257,10 +286,25 @@ export async function POST(request: NextRequest) {
       { turnId, traceId, action: "L1 append", at: now },
       { turnId, traceId, action: "L2 update", at: now },
       { turnId, traceId, action: "L3 version_write", at: now },
+      { turnId, traceId, action: "retrieval_injection", at: now },
     ];
     if (turnId > 0 && turnId % 50 === 0) {
       timeline.push({ turnId, traceId, action: "L3 distillation_requested", at: now });
     }
+
+    const evidenceRefs = episodicHits.map((hit) => ({
+      sourceLayer: "L1",
+      sourceId: `msg-${hit.messageIndex + 1}`,
+      sourceTurnId: hit.messageIndex + 1,
+      score: hit.score,
+    }));
+
+    const governance: GovernanceMeta = {
+      consent: true,
+      policyVersion: "v1",
+      fieldCount: Object.keys(governedProfile).length,
+      traceId,
+    };
 
     return NextResponse.json({
       traceId,
@@ -280,15 +324,19 @@ export async function POST(request: NextRequest) {
           workingSummary,
           entityFocus: turnSignals.entities,
         },
-        l3: profile,
+        l3: governedProfile,
       },
       retrieval: {
         semanticVersion: turnId,
-        semanticFields: Object.keys(profile),
+        semanticFields: Object.keys(governedProfile),
+        evidenceRefs,
+        retrievalSources: ["semantic", "episodic", "working"],
+        distillationBatchStatus: turnId > 0 && turnId % 50 === 0 ? "requested" : "idle",
         episodicHits,
         workingSummary,
         injectedPrompt: memoryPrompt,
       },
+      governance,
       timeline,
     });
   } catch (error) {

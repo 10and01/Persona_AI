@@ -2,8 +2,10 @@
 
 import { FormEvent, useMemo, useState } from "react";
 import { WordCloud } from "./components/WordCloud";
+import { streamChatTurn } from "./lib/api";
 import {
   ChatMessage,
+  GovernanceMeta,
   L1Record,
   L2Context,
   PersonaProfile,
@@ -22,6 +24,8 @@ function toCloudEntries(profile: PersonaProfile) {
   return Object.entries(profile).map(([k, v]) => ({
     term: `${k}:${v.value}`,
     weight: Math.max(0.15, Math.min(1, v.confidence)),
+    recency: 0.85,
+    conflict: v.evidenceClass.includes("contradiction"),
   }));
 }
 
@@ -59,18 +63,28 @@ export default function HomePage() {
   const [profile, setProfile] = useState<PersonaProfile>({});
   const [timeline, setTimeline] = useState<TimelineItem[]>([]);
   const [retrieval, setRetrieval] = useState<RetrievalContext | null>(null);
+  const [governance, setGovernance] = useState<GovernanceMeta | null>(null);
+  const [profileByVersion, setProfileByVersion] = useState<Record<number, PersonaProfile>>({});
+  const [selectedSemanticVersion, setSelectedSemanticVersion] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
+  const activeProfile = useMemo(() => {
+    if (selectedSemanticVersion && profileByVersion[selectedSemanticVersion]) {
+      return profileByVersion[selectedSemanticVersion];
+    }
+    return profile;
+  }, [profile, profileByVersion, selectedSemanticVersion]);
+
   const cards = useMemo(
     () =>
-      Object.entries(profile)
+      Object.entries(activeProfile)
         .map(([name, field]) => ({ name, ...field }))
         .sort((a, b) => b.confidence - a.confidence),
-    [profile],
+    [activeProfile],
   );
 
-  const cloudEntries = useMemo(() => toCloudEntries(profile), [profile]);
+  const cloudEntries = useMemo(() => toCloudEntries(activeProfile), [activeProfile]);
 
   async function onSend(e: FormEvent) {
     e.preventDefault();
@@ -81,44 +95,84 @@ export default function HomePage() {
     const userText = draft.trim();
     const nextTurn = l1.length + 1;
     const nextMessages = [...messages, { role: "user", content: userText } as ChatMessage];
-    setMessages(nextMessages);
+    const assistantIndex = nextMessages.length;
+    setMessages([...nextMessages, { role: "assistant", content: "" }]);
     setDraft("");
 
     try {
-      const resp = await fetch("/api/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          provider,
-          turnId: nextTurn,
-          userText,
-          messages: nextMessages,
-        }),
-      });
+      let streamFailed = false;
+      await streamChatTurn(
+        {
+        provider,
+        turnId: nextTurn,
+        userText,
+        messages: nextMessages,
+        },
+        {
+          onToken: (token) => {
+            setMessages((prev) => {
+              if (!prev[assistantIndex] || prev[assistantIndex].role !== "assistant") return prev;
+              const next = [...prev];
+              next[assistantIndex] = {
+                ...next[assistantIndex],
+                content: `${next[assistantIndex].content}${token}`,
+              };
+              return next;
+            });
+          },
+          onDone: (data) => {
+            const assistantText = String(data.assistantText || "");
+            setMessages((prev) => {
+              if (!prev[assistantIndex] || prev[assistantIndex].role !== "assistant") return prev;
+              const next = [...prev];
+              next[assistantIndex] = {
+                ...next[assistantIndex],
+                content: assistantText || next[assistantIndex].content,
+              };
+              return next;
+            });
 
-      if (!resp.ok) {
-        const txt = await resp.text();
-        throw new Error(txt || "Chat request failed");
-      }
+            if (data?.memory?.l1) setL1((prev) => [...prev, data.memory.l1 as L1Record]);
+            if (data?.memory?.l2) setL2(data.memory.l2 as L2Context);
+            if (data?.memory?.l3) setProfile(data.memory.l3 as PersonaProfile);
+            setRetrieval((data?.retrieval as RetrievalContext) || null);
+            setGovernance((data?.governance as GovernanceMeta) || null);
+            if (data?.retrieval?.semanticVersion && data?.memory?.l3) {
+              setProfileByVersion((prev) => ({
+                ...prev,
+                [Number(data.retrieval.semanticVersion)]: data.memory.l3 as PersonaProfile,
+              }));
+              setSelectedSemanticVersion(Number(data.retrieval.semanticVersion));
+            }
+            if (Array.isArray(data?.timeline)) {
+              setTimeline((prev) => [...prev, ...(data.timeline as TimelineItem[])]);
+            }
+          },
+          onError: (message) => {
+            streamFailed = true;
+            setErr(message || "stream error");
+            setMessages((prev) => prev.filter((_, idx) => idx !== assistantIndex));
+          },
+        },
+      );
 
-      const data = await resp.json();
-      const assistantText = String(data.assistantText || "");
-
-      setMessages((prev) => [...prev, { role: "assistant", content: assistantText }]);
-      setL1((prev) => [...prev, data.memory.l1 as L1Record]);
-      setL2(data.memory.l2 as L2Context);
-      setProfile(data.memory.l3 as PersonaProfile);
-      setRetrieval((data.retrieval as RetrievalContext) || null);
-      setTimeline((prev) => [...prev, ...(data.timeline as TimelineItem[])]);
+      if (streamFailed) return;
     } catch (error) {
       setErr(error instanceof Error ? error.message : "unknown error");
+      setMessages((prev) => prev.filter((msg, idx) => !(idx === prev.length - 1 && msg.role === "assistant" && !msg.content)));
     } finally {
       setBusy(false);
     }
   }
 
   function exportProfileJson() {
-    const blob = new Blob([JSON.stringify(profile, null, 2)], { type: "application/json" });
+    const payload = {
+      profile: activeProfile,
+      governance,
+      retrieval,
+      exportedAt: new Date().toISOString(),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const a = document.createElement("a");
     a.download = "persona-profile.json";
     a.href = URL.createObjectURL(blob);
@@ -272,11 +326,19 @@ export default function HomePage() {
                   {
                     semanticVersion: retrieval.semanticVersion,
                     semanticFields: retrieval.semanticFields,
+                    retrievalSources: retrieval.retrievalSources,
+                    distillationBatchStatus: retrieval.distillationBatchStatus,
                     workingSummary: retrieval.workingSummary,
                   },
                   null,
                   2,
                 )}
+              </pre>
+            </div>
+            <div style={{ border: "1px solid var(--line)", borderRadius: 10, padding: 10, background: "#fff" }}>
+              <strong>Evidence References</strong>
+              <pre style={{ margin: "8px 0 0", whiteSpace: "pre-wrap", fontSize: 12 }}>
+                {JSON.stringify(retrieval.evidenceRefs, null, 2)}
               </pre>
             </div>
             <div style={{ border: "1px solid var(--line)", borderRadius: 10, padding: 10, background: "#fff" }}>
@@ -293,10 +355,45 @@ export default function HomePage() {
                 </div>
               )}
             </div>
+            <div style={{ border: "1px solid var(--line)", borderRadius: 10, padding: 10, background: "#fff" }}>
+              <strong>Governance Metadata</strong>
+              <pre style={{ margin: "8px 0 0", whiteSpace: "pre-wrap", fontSize: 12 }}>
+                {JSON.stringify(governance || {}, null, 2)}
+              </pre>
+            </div>
           </div>
         ) : (
           <p style={{ color: "var(--muted)" }}>Send a message to see semantic + episodic retrieval context.</p>
         )}
+      </section>
+
+      <section className="card fade-up" style={{ marginTop: 16, padding: 16 }}>
+        <h2 style={{ fontSize: 24, marginBottom: 10 }}>Semantic Version Timeline</h2>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {Object.keys(profileByVersion).length === 0 ? (
+            <p style={{ color: "var(--muted)" }}>No semantic versions yet.</p>
+          ) : (
+            Object.keys(profileByVersion)
+              .map((key) => Number(key))
+              .sort((a, b) => b - a)
+              .map((version) => (
+                <button
+                  key={version}
+                  onClick={() => setSelectedSemanticVersion(version)}
+                  style={{
+                    border: "1px solid var(--line)",
+                    background: selectedSemanticVersion === version ? "#0f766e" : "#fff",
+                    color: selectedSemanticVersion === version ? "#fff" : "#1f2937",
+                    borderRadius: 999,
+                    padding: "6px 12px",
+                    cursor: "pointer",
+                  }}
+                >
+                  v{version}
+                </button>
+              ))
+          )}
+        </div>
       </section>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>

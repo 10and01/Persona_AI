@@ -163,7 +163,8 @@ class OpenAICompatibleAdapter(ProviderAdapter):
     def stream(self, request_data: ChatRequest) -> Iterable[TokenChunk]:
         response = self.generate(request_data)
         if response.error:
-            yield TokenChunk(trace_id=request_data.trace_id, index=0, text="", done=True)
+            error_text = f"[ProviderError:{response.error.category.value}] {response.error.message}"
+            yield TokenChunk(trace_id=request_data.trace_id, index=0, text=error_text, done=True)
             return
         tokens = response.output_text.split()
         for i, token in enumerate(tokens):
@@ -232,7 +233,8 @@ class AnthropicCompatibleAdapter(ProviderAdapter):
     def stream(self, request_data: ChatRequest) -> Iterable[TokenChunk]:
         response = self.generate(request_data)
         if response.error:
-            yield TokenChunk(trace_id=request_data.trace_id, index=0, text="", done=True)
+            error_text = f"[ProviderError:{response.error.category.value}] {response.error.message}"
+            yield TokenChunk(trace_id=request_data.trace_id, index=0, text=error_text, done=True)
             return
         tokens = response.output_text.split()
         for i, token in enumerate(tokens):

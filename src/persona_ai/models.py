@@ -17,6 +17,50 @@ class EvidenceClass(str, Enum):
     STATISTICAL_INFERENCE = "statistical_inference"
 
 
+class DistillStatus(str, Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class EvidenceRef:
+    source_layer: str
+    source_id: str
+    source_turn_id: int
+
+
+@dataclass(frozen=True)
+class MemoryMetadata:
+    timestamp: datetime = field(default_factory=utc_now)
+    trace_id: str = ""
+    confidence: float = 0.0
+    source_turn_id: int = -1
+
+    @staticmethod
+    def from_dict(data: Dict[str, Any]) -> "MemoryMetadata":
+        timestamp = data.get("timestamp")
+        if isinstance(timestamp, str):
+            timestamp = datetime.fromisoformat(timestamp)
+        if not isinstance(timestamp, datetime):
+            timestamp = utc_now()
+        return MemoryMetadata(
+            timestamp=timestamp,
+            trace_id=str(data.get("trace_id", "")),
+            confidence=float(data.get("confidence", 0.0)),
+            source_turn_id=int(data.get("source_turn_id", -1)),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "timestamp": self.timestamp.isoformat(),
+            "trace_id": self.trace_id,
+            "confidence": self.confidence,
+            "source_turn_id": self.source_turn_id,
+        }
+
+
 @dataclass(frozen=True)
 class Evidence:
     evidence_class: EvidenceClass
@@ -36,6 +80,10 @@ class L1DialogRecord:
     assistant_output: str
     occurred_at: datetime
     metadata: Dict[str, Any] = field(default_factory=dict)
+    sentiment: str = "neutral"
+    entities: List[str] = field(default_factory=list)
+    evidence_ref: List[EvidenceRef] = field(default_factory=list)
+    distill_status: DistillStatus = DistillStatus.PENDING
 
 
 @dataclass(frozen=True)
@@ -58,6 +106,7 @@ class L2SessionContext:
     summary: str = ""
     task_state: Dict[str, Any] = field(default_factory=dict)
     entity_focus: List[str] = field(default_factory=list)
+    distill_status: DistillStatus = DistillStatus.PENDING
 
 
 @dataclass
@@ -66,6 +115,7 @@ class L3ProfileField:
     value: Any
     confidence: float
     evidence: List[Evidence] = field(default_factory=list)
+    evidence_ref: List[EvidenceRef] = field(default_factory=list)
     contradictions: List[Evidence] = field(default_factory=list)
     updated_at: datetime = field(default_factory=utc_now)
 
@@ -78,6 +128,7 @@ class L3ProfileVersion:
     fields: Dict[str, L3ProfileField]
     previous_version: Optional[int] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    distill_status: DistillStatus = DistillStatus.PENDING
 
 
 @dataclass(frozen=True)

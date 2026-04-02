@@ -13,6 +13,40 @@ from persona_ai.privacy import PrivacyController
 from persona_ai.storage import MemoryStore
 
 
+class CountingEpisodicStore:
+    def __init__(self) -> None:
+        self.deleted = 0
+
+    def upsert_dialog(self, record, metadata, idempotency_key):
+        _ = (record, metadata, idempotency_key)
+
+    def search_dialogs(self, **kwargs):
+        _ = kwargs
+        return []
+
+    def delete_user_scope(self, user_id: str, scope: str) -> int:
+        _ = (user_id, scope)
+        self.deleted += 1
+        return 1
+
+
+class CountingSemanticStore:
+    def __init__(self) -> None:
+        self.deleted = 0
+
+    def upsert_profile_version(self, version, metadata):
+        _ = (version, metadata)
+
+    def latest_profile_version(self, user_id: str):
+        _ = user_id
+        return None
+
+    def delete_user_scope(self, user_id: str, scope: str) -> int:
+        _ = (user_id, scope)
+        self.deleted += 1
+        return 1
+
+
 class GoodAdapter:
     def load_profile(self, user_id: str):
         return {"user_id": user_id}
@@ -61,6 +95,32 @@ class TestPortabilityPrivacyEval(unittest.TestCase):
 
         exported = ctrl.export_profile("u1", consent=True, actor="user")
         self.assertIn("response_style", exported)
+
+        sanitized = ctrl.sanitize_record_payload(
+            {"note": "email me at a@b.com and id 123456789012"},
+            actor="system",
+        )
+        self.assertIn("[REDACTED_EMAIL]", sanitized["note"])
+        self.assertIn("[REDACTED_NUMBER]", sanitized["note"])
+
+        governed = ctrl.governed_injection_fields(
+            purpose="response_formatting",
+            candidate_fields={"response_style": "detailed", "language": "zh"},
+            actor="plugin",
+        )
+        self.assertEqual(governed, {"response_style": "detailed"})
+
+    def test_delete_scope_propagates_to_external_stores(self) -> None:
+        episodic = CountingEpisodicStore()
+        semantic = CountingSemanticStore()
+        store = MemoryStore(episodic_store=episodic, semantic_store=semantic)
+        audit = ImmutableAuditLog()
+        policy = PurposePolicy({"response_formatting": {"response_style"}})
+        ctrl = PrivacyController(policy, store, audit)
+
+        deleted = ctrl.delete_scope("u-clean", "complete", actor="user")
+        self.assertEqual(deleted["deleted"]["episodic"], 1)
+        self.assertEqual(deleted["deleted"]["semantic"], 1)
 
     def test_offline_and_online_gates(self) -> None:
         metrics = OfflineMetrics(0.9, 0.04, 0.91, 0.999)
